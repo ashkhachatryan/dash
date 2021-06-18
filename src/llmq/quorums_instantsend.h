@@ -26,13 +26,83 @@ public:
     CBLSLazySignature sig;
 
 public:
-    SERIALIZE_METHODS(CInstantSendLock, obj)
+    virtual CInstantSendLock& operator=(CInstantSendLock& lock)
     {
-        READWRITE(obj.inputs, obj.txid, obj.sig);
+        this->inputs = lock.inputs;
+        this->txid = lock.txid;
+        this->sig = lock.sig;
+        return *this;
     }
+    virtual void Serialize(CDataStream& s) const = 0;
+    virtual void Serialize(CHashWriter& s) const = 0;
+    virtual void Serialize(CVectorWriter& s) const = 0;
+    virtual void Unserialize(CDataStream& s) = 0;
 
     uint256 GetRequestId() const;
 };
+
+class CInstantSendLockDeprecated : public CInstantSendLock
+{
+public:
+    void Serialize(CDataStream& s) const
+    {
+        ::SerializeMany(s, inputs, txid, sig);
+    }
+
+    void Serialize(CHashWriter& s) const
+    {
+        ::SerializeMany(s, inputs, txid, sig);
+    }
+
+    void Serialize(CVectorWriter& s) const
+    {
+        ::SerializeMany(s, inputs, txid, sig);
+    }
+
+    void Unserialize(CDataStream& s)
+    {
+        ::UnserializeMany(s, inputs, txid, sig);
+    }
+};
+
+class CInstantSendLockDeterministic : public CInstantSendLock
+{
+public:
+    int32_t nVersion = 1;
+    uint256 cycleHash;
+
+    virtual CInstantSendLock& operator=(CInstantSendLock& lock)
+    {
+        CInstantSendLockDeterministic l = static_cast<CInstantSendLockDeterministic&>(lock);
+        this->inputs = l.inputs;
+        this->txid = l.txid;
+        this->sig = l.sig;
+        this->nVersion = l.nVersion;
+        this->cycleHash = l.cycleHash;
+        return *this;
+    }
+
+    void Serialize(CDataStream& s) const
+    {
+        ::SerializeMany(s, nVersion, cycleHash, inputs, txid, sig);
+    }
+
+    void Serialize(CHashWriter& s) const
+    {
+        ::SerializeMany(s, nVersion, cycleHash, inputs, txid, sig);
+    }
+
+    void Serialize(CVectorWriter& s) const
+    {
+        ::SerializeMany(s, nVersion, cycleHash, inputs, txid, sig);
+    }
+
+    void Unserialize(CDataStream& s)
+    {
+        ::UnserializeMany(s, nVersion, cycleHash, inputs, txid, sig);
+    }
+};
+
 
 typedef std::shared_ptr<CInstantSendLock> CInstantSendLockPtr;
 
@@ -98,7 +168,7 @@ private:
      * recovered signatures for all inputs of a TX. At the same time, we initiate signing of our sigshare for the islock.
      * When the recovered sig for the islock later arrives, we can finish the islock and propagate it.
      */
-    std::unordered_map<uint256, CInstantSendLock, StaticSaltedHasher> creatingInstantSendLocks GUARDED_BY(cs);
+    std::unordered_map<uint256, CInstantSendLock*, StaticSaltedHasher> creatingInstantSendLocks GUARDED_BY(cs);
     // maps from txid to the in-progress islock
     std::unordered_map<uint256, CInstantSendLock*, StaticSaltedHasher> txToCreatingInstantSendLocks GUARDED_BY(cs);
 
@@ -139,6 +209,7 @@ private:
 
     void ProcessMessageInstantSendLock(CNode* pfrom, const CInstantSendLockPtr& islock);
     static bool PreVerifyInstantSendLock(const CInstantSendLock& islock);
+    bool VerifyInstantSendLock(const CInstantSendLock& islock);
     bool ProcessPendingInstantSendLocks();
     std::unordered_set<uint256> ProcessPendingInstantSendLocks(int signOffset, const std::unordered_map<uint256, std::pair<NodeId, CInstantSendLockPtr>, StaticSaltedHasher>& pend, bool ban);
     void ProcessInstantSendLock(NodeId from, const uint256& hash, const CInstantSendLockPtr& islock);

@@ -754,6 +754,7 @@ std::chrono::microseconds GetObjectInterval(int invType)
         case MSG_CLSIG:
             return std::chrono::seconds{5};
         case MSG_ISLOCK:
+        case MSG_ISDLOCK:
             return std::chrono::seconds{10};
         default:
             return GETDATA_TX_INTERVAL;
@@ -1391,6 +1392,7 @@ bool static AlreadyHave(const CInv& inv) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     case MSG_CLSIG:
         return llmq::chainLocksHandler->AlreadyHave(inv);
     case MSG_ISLOCK:
+    case MSG_ISDLOCK:
         return llmq::quorumInstantSendManager->AlreadyHave(inv);
     }
 
@@ -1540,7 +1542,10 @@ void static ProcessGetBlockData(CNode* pfrom, const CChainParams& chainparams, c
                     for (PairType &pair : merkleBlock.vMatchedTxn) {
                         auto islock = llmq::quorumInstantSendManager->GetInstantSendLockByTxid(pair.second);
                         if (islock != nullptr) {
-                            connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::ISLOCK, *islock));
+                            if (Params().DIP00XXISDLockEnabled())
+                                connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::ISDLOCK, *islock));
+                            else
+                                connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::ISLOCK, *islock));
                         }
                     }
                 }
@@ -1728,9 +1733,17 @@ void static ProcessGetData(CNode* pfrom, const CChainParams& chainparams, CConnm
             }
 
             if (!push && (inv.type == MSG_ISLOCK)) {
-                llmq::CInstantSendLock o;
+                llmq::CInstantSendLockDeprecated o;
                 if (llmq::quorumInstantSendManager->GetInstantSendLockByHash(inv.hash, o)) {
                     connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::ISLOCK, o));
+                    push = true;
+                }
+            }
+
+            if (!push && (inv.type == MSG_ISDLOCK)) {
+                llmq::CInstantSendLockDeterministic o;
+                if (llmq::quorumInstantSendManager->GetInstantSendLockByHash(inv.hash, o)) {
+                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::ISDLOCK, o));
                     push = true;
                 }
             }
@@ -4272,7 +4285,10 @@ bool PeerLogicValidation::SendMessages(CNode* pto)
 
                     uint256 islockHash;
                     if (!llmq::quorumInstantSendManager->GetInstantSendLockHashByTxid(hash, islockHash)) continue;
-                    queueAndMaybePushInv(CInv(MSG_ISLOCK, islockHash));
+                    if (Params().DIP00XXISDLockEnabled())
+                        queueAndMaybePushInv(CInv(MSG_ISDLOCK, islockHash));
+                    else
+                        queueAndMaybePushInv(CInv(MSG_ISLOCK, islockHash));
                 }
 
                 // Send an inv for the best ChainLock we have

@@ -60,7 +60,12 @@ void CInstantSendDb::Upgrade()
     int v{0};
     if (!db.Read(DB_VERSION, v) || v < CInstantSendDb::CURRENT_VERSION) {
         CDBBatch batch(db);
-        CInstantSendLock islock;
+        CInstantSendLock* islock;
+        if (Params().DIP00XXISDLockEnabled())
+            islock = new CInstantSendLockDeterministic();
+        else
+            islock = new CInstantSendLockDeprecated();
+
         CTransactionRef tx;
         uint256 hashBlock;
 
@@ -73,11 +78,11 @@ void CInstantSendDb::Upgrade()
             if (!it->GetKey(curKey) || std::get<0>(curKey) != DB_ISLOCK_BY_HASH) {
                 break;
             }
-            if (it->GetValue(islock)) {
-                if (!GetTransaction(islock.txid, tx, Params().GetConsensus(), hashBlock)) {
+            if (it->GetValue(*islock)) {
+                if (!GetTransaction(islock->txid, tx, Params().GetConsensus(), hashBlock)) {
                     // Drop locks for unknown txes
-                    batch.Erase(std::make_tuple(DB_HASH_BY_TXID, islock.txid));
-                    for (auto& in : islock.inputs) {
+                    batch.Erase(std::make_tuple(DB_HASH_BY_TXID, islock->txid));
+                    for (auto& in : islock->inputs) {
                         batch.Erase(std::make_tuple(DB_HASH_BY_OUTPOINT, in));
                     }
                     batch.Erase(curKey);
@@ -100,7 +105,12 @@ void CInstantSendDb::WriteNewInstantSendLock(const uint256& hash, const CInstant
     }
     db.WriteBatch(batch);
 
-    auto p = std::make_shared<CInstantSendLock>(islock);
+    CInstantSendLockPtr p;
+    if (Params().DIP00XXISDLockEnabled())
+        p = std::make_shared<CInstantSendLockDeterministic>(static_cast<const CInstantSendLockDeterministic&>(islock));
+    else
+        p = std::make_shared<CInstantSendLockDeprecated>(static_cast<const CInstantSendLockDeprecated&>(islock));
+
     islockCache.insert(hash, p);
     txidCache.insert(islock.txid, hash);
     for (auto& in : islock.inputs) {
@@ -308,7 +318,10 @@ CInstantSendLockPtr CInstantSendDb::GetInstantSendLockByHash(const uint256& hash
         return ret;
     }
 
-    ret = std::make_shared<CInstantSendLock>();
+    if (Params().DIP00XXISDLockEnabled())
+        ret = std::make_shared<CInstantSendLockDeterministic>();
+    else
+        ret = std::make_shared<CInstantSendLockDeprecated>();
     bool exists = db.Read(std::make_tuple(DB_ISLOCK_BY_HASH, hash), *ret);
     if (!exists) {
         ret = nullptr;
@@ -678,13 +691,18 @@ void CInstantSendManager::TrySignInstantSendLock(const CTransaction& tx)
     LogPrint(BCLog::INSTANTSEND, "CInstantSendManager::%s -- txid=%s: got all recovered sigs, creating CInstantSendLock\n", __func__,
             tx.GetHash().ToString());
 
-    CInstantSendLock islock;
-    islock.txid = tx.GetHash();
+    CInstantSendLock* islock;
+    if (Params().DIP00XXISDLockEnabled())
+        islock = new CInstantSendLockDeterministic();
+    else
+        islock = new CInstantSendLockDeprecated();
+
+    islock->txid = tx.GetHash();
     for (auto& in : tx.vin) {
-        islock.inputs.emplace_back(in.prevout);
+        islock->inputs.emplace_back(in.prevout);
     }
 
-    auto id = islock.GetRequestId();
+    auto id = islock->GetRequestId();
 
     if (quorumSigningManager->HasRecoveredSigForId(llmqType, id)) {
         return;
@@ -692,11 +710,11 @@ void CInstantSendManager::TrySignInstantSendLock(const CTransaction& tx)
 
     {
         LOCK(cs);
-        auto e = creatingInstantSendLocks.emplace(id, std::move(islock));
+        auto e = creatingInstantSendLocks.emplace(id, islock);
         if (!e.second) {
             return;
         }
-        txToCreatingInstantSendLocks.emplace(tx.GetHash(), &e.first->second);
+        txToCreatingInstantSendLocks.emplace(tx.GetHash(), e.first->second);
     }
 
     quorumSigningManager->AsyncSignIfMember(llmqType, id, tx.GetHash());
@@ -713,7 +731,10 @@ void CInstantSendManager::HandleNewInstantSendLockRecoveredSig(const llmq::CReco
             return;
         }
 
-        islock = std::make_shared<CInstantSendLock>(std::move(it->second));
+        if (Params().DIP00XXISDLockEnabled())
+            islock = std::make_shared<CInstantSendLockDeterministic>(static_cast<const CInstantSendLockDeterministic&>(*it->second));
+        else
+            islock = std::make_shared<CInstantSendLockDeprecated>(static_cast<const CInstantSendLockDeprecated&>(*it->second));
         creatingInstantSendLocks.erase(it);
         txToCreatingInstantSendLocks.erase(islock->txid);
     }
@@ -725,6 +746,40 @@ void CInstantSendManager::HandleNewInstantSendLockRecoveredSig(const llmq::CReco
     }
 
     islock->sig = recoveredSig.sig;
+    // Add cycleHash to islock
+    if (Params().DIP00XXISDLockEnabled())
+    {
+        auto llmqType = Params().GetConsensus().llmqTypeInstantSend;
+        const auto& params = llmq::GetLLMQParams(llmqType);
+        auto id = islock->GetRequestId();
+
+        CBlockIndex* pindexTip;
+        {
+            LOCK(cs_main);
+            pindexTip = chainActive.Tip();
+        }
+        int tipHeight = pindexTip->nHeight;
+        int quorumHeight = tipHeight - (tipHeight % params.dkgInterval);
+
+        // Quorum have just cycled, so checking the previous one as well
+        if (quorumHeight == tipHeight) {
+            int tipPrevHeight = tipHeight - 1;
+            auto quorumPrev = quorumSigningManager->SelectQuorumForSigning(llmqType, id, tipPrevHeight);
+            if (quorumPrev->pindexQuorum->GetBlockHash() == recoveredSig.quorumHash) {
+                // Quorum was responsible for signing previous cycle as well
+                auto pindexQuorum = chainActive[tipPrevHeight - (tipPrevHeight % params.dkgInterval)];
+                static_cast<CInstantSendLockDeterministic&>(*islock).cycleHash = pindexQuorum->GetBlockHash();
+                ProcessInstantSendLock(-1, ::SerializeHash(*islock), islock);
+            }
+        }
+
+        auto quorumCurrent = quorumSigningManager->SelectQuorumForSigning(llmqType, id, tipHeight);
+        if (quorumCurrent->pindexQuorum->GetBlockHash() == recoveredSig.quorumHash) {
+            auto pindexQuorum = chainActive[quorumHeight];
+            static_cast<CInstantSendLockDeterministic&>(*islock).cycleHash = pindexQuorum->GetBlockHash();
+        }
+    }
+
     ProcessInstantSendLock(-1, ::SerializeHash(*islock), islock);
 }
 
@@ -735,7 +790,13 @@ void CInstantSendManager::ProcessMessage(CNode* pfrom, const std::string& strCom
     }
 
     if (strCommand == NetMsgType::ISLOCK) {
-        CInstantSendLockPtr islock = std::make_shared<CInstantSendLock>();
+        CInstantSendLockPtr islock = std::make_shared<CInstantSendLockDeprecated>();
+        vRecv >> *islock;
+        ProcessMessageInstantSendLock(pfrom, islock);
+    }
+
+    if (strCommand == NetMsgType::ISDLOCK) {
+        CInstantSendLockPtr islock = std::make_shared<CInstantSendLockDeterministic>();
         vRecv >> *islock;
         ProcessMessageInstantSendLock(pfrom, islock);
     }
@@ -747,13 +808,24 @@ void CInstantSendManager::ProcessMessageInstantSendLock(CNode* pfrom, const llmq
 
     {
         LOCK(cs_main);
-        EraseObjectRequest(pfrom->GetId(), CInv(MSG_ISLOCK, hash));
+        if (Params().DIP00XXISDLockEnabled())
+            EraseObjectRequest(pfrom->GetId(), CInv(MSG_ISDLOCK, hash));
+        else
+            EraseObjectRequest(pfrom->GetId(), CInv(MSG_ISLOCK, hash));
     }
 
     if (!PreVerifyInstantSendLock(*islock)) {
         LOCK(cs_main);
         Misbehaving(pfrom->GetId(), 100);
         return;
+    }
+
+    if (Params().DIP00XXISDLockEnabled()) {
+        if (!VerifyInstantSendLock(*islock)) {
+            LOCK(cs_main);
+            Misbehaving(pfrom->GetId(), 100);
+            return;
+        }
     }
 
     LOCK(cs);
@@ -787,6 +859,26 @@ bool CInstantSendManager::PreVerifyInstantSendLock(const llmq::CInstantSendLock&
     }
 
     return true;
+}
+
+bool CInstantSendManager::VerifyInstantSendLock(const CInstantSendLock& islock)
+{
+    auto llmqType = Params().GetConsensus().llmqTypeInstantSend;
+    const auto& params = llmq::GetLLMQParams(llmqType);
+
+    uint256 cycleHash = static_cast<const CInstantSendLockDeterministic&>(islock).cycleHash;
+    CBlockIndex* pindexTip = LookupBlockIndex(cycleHash);
+    if (pindexTip->nHeight % params.dkgInterval != 0) {
+        // Cycle hash is not the first block hash in any cicle
+        return false;
+    }
+
+    // Select responsible quorum from quorum set
+    auto quorum = llmq::CSigningManager::SelectQuorumForSigning(llmqType, islock.GetRequestId(), pindexTip->nHeight);
+
+    // Create the SignID
+    uint256 signHash = CLLMQUtils::BuildSignHash(llmqType, quorum->qc->quorumHash, islock.GetRequestId(), islock.txid);
+    return islock.sig.Get().VerifyInsecure(quorum->qc->quorumPublicKey, signHash);
 }
 
 bool CInstantSendManager::ProcessPendingInstantSendLocks()
@@ -1007,7 +1099,12 @@ void CInstantSendManager::ProcessInstantSendLock(NodeId from, const uint256& has
         TruncateRecoveredSigsForInputs(*islock);
     }
 
-    CInv inv(MSG_ISLOCK, hash);
+    CInv inv;
+    if (Params().DIP00XXISDLockEnabled())
+        inv = CInv(MSG_ISDLOCK, hash);
+    else
+        inv = CInv(MSG_ISLOCK, hash);
+
     if (tx != nullptr) {
         g_connman->RelayInvFiltered(inv, *tx, LLMQS_PROTO_VERSION);
     } else {
@@ -1052,7 +1149,12 @@ void CInstantSendManager::TransactionAddedToMempool(const CTransactionRef& tx)
         }
         // In case the islock was received before the TX, filtered announcement might have missed this islock because
         // we were unable to check for filter matches deep inside the TX. Now we have the TX, so we should retry.
-        CInv inv(MSG_ISLOCK, ::SerializeHash(*islock));
+        CInv inv;
+        if (Params().DIP00XXISDLockEnabled())
+            inv = CInv(MSG_ISDLOCK, ::SerializeHash(*islock));
+        else
+            inv = CInv(MSG_ISLOCK, ::SerializeHash(*islock));
+
         g_connman->RelayInvFiltered(inv, *tx, LLMQS_PROTO_VERSION);
         // If the islock was received before the TX, we know we were not able to send
         // the notification at that time, we need to do it now.

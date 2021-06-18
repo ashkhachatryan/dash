@@ -102,6 +102,7 @@ public:
     const std::vector<std::string>& SporkAddresses() const { return vSporkAddresses; }
     int MinSporkKeys() const { return nMinSporkKeys; }
     bool BIP9CheckMasternodesUpgraded() const { return fBIP9CheckMasternodesUpgraded; }
+    bool DIP00XXISDLockEnabled() const { return fDIP00XXISDLockEnabled; }
 protected:
     CChainParams() {}
 
@@ -131,6 +132,7 @@ protected:
     std::vector<std::string> vSporkAddresses;
     int nMinSporkKeys;
     bool fBIP9CheckMasternodesUpgraded;
+    bool fDIP00XXISDLockEnabled = true;
 };
 
 /**
